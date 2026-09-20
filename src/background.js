@@ -16,9 +16,23 @@ function getAuthToken(interactive) {
   });
 }
 
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Silent token request timed out")), ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 async function getToken() {
   try {
-    return await getAuthToken(false);
+    // chrome.identity.getAuthToken({interactive: false}) can hang
+    // indefinitely (never call back at all) instead of rejecting when no
+    // silent grant is available — bound it so a stuck silent check always
+    // falls through to the interactive flow rather than hanging the scan.
+    return await withTimeout(getAuthToken(false), 5000);
   } catch {
     return await getAuthToken(true);
   }
