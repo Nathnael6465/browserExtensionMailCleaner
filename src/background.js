@@ -38,15 +38,34 @@ async function getToken() {
   }
 }
 
+function isRateLimitError(status, bodyText) {
+  if (status === 429) return true;
+  return status === 403 && /rateLimitExceeded|RATE_LIMIT_EXCEEDED/i.test(bodyText);
+}
+
+// Gmail API enforces a per-user quota (units/minute) that a bounded-
+// concurrency scan of a large inbox can trip well before finishing.
+// Google's own guidance for 403/429 quota errors is exponential
+// backoff, not failing the whole request — retry a handful of times
+// before giving up, so a burst above the quota just slows down rather
+// than aborting the entire scan.
 async function gmailFetch(token, path, options = {}) {
-  const resp = await fetch(`${GMAIL_API}${path}`, {
-    ...options,
-    headers: { Authorization: `Bearer ${token}`, ...options.headers },
-  });
-  if (!resp.ok) {
-    throw new Error(`Gmail API error ${resp.status}: ${await resp.text()}`);
+  const maxRetries = 5;
+  let delay = 1000;
+  for (let attempt = 0; ; attempt++) {
+    const resp = await fetch(`${GMAIL_API}${path}`, {
+      ...options,
+      headers: { Authorization: `Bearer ${token}`, ...options.headers },
+    });
+    if (resp.ok) return resp.json();
+
+    const bodyText = await resp.text();
+    if (!isRateLimitError(resp.status, bodyText) || attempt >= maxRetries) {
+      throw new Error(`Gmail API error ${resp.status}: ${bodyText}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay *= 2;
   }
-  return resp.json();
 }
 
 async function listInboxMessageIds(token) {
