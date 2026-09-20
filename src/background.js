@@ -84,9 +84,20 @@ function paceRequest() {
 // Backoff is still needed as a safety net (other tabs/tools sharing
 // the same quota, a burst right at a window boundary), just no longer
 // the primary defense against exceeding it.
+//
+// Manifest V3 service workers can be torn down after ~30s with no
+// active network activity, and setTimeout does NOT keep a service
+// worker alive on its own (this is documented Chrome behavior, not a
+// guess) — a single backoff wait anywhere near that long risks the
+// whole scan silently dying mid-wait with no error. This bit for real
+// near the tail of a large scan: with only a few concurrent workers
+// left and no other requests in flight to keep the worker "warm", a
+// stray 60s wait got the worker killed and the scan just stopped,
+// frozen, with nothing logged. Keep every individual wait well under
+// that danger zone; more, shorter retries make up the difference.
 async function gmailFetch(token, path, options = {}) {
-  const maxRetries = 8;
-  const maxDelay = 60000;
+  const maxRetries = 12;
+  const maxDelay = 15000;
   let delay = 1000;
   for (let attempt = 0; ; attempt++) {
     await paceRequest();
