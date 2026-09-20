@@ -1,0 +1,13 @@
+{
+  "name": "browser-extension-mail-cleaner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome extension: scans Gmail via the Gmail API and flags untrusted senders using a default-deny domain-trust classifier.",
+  "scripts": {
+    "test": "node --test 'test/**/*.test.js'"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
