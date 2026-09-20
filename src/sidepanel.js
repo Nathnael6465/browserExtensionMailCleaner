@@ -46,6 +46,56 @@ async function loadCached() {
   if (cached) renderDigest(cached.aggregated, cached.scannedAt);
 }
 
+// The panel can be closed and reopened at any point during a scan that
+// runs for many minutes — the scan itself keeps running in the
+// background regardless, so a freshly opened panel needs to be able
+// to show "how far along is it" rather than just the blank default
+// state, and an already-open panel needs to keep updating live.
+function showScanningState(done, total) {
+  scanButton.disabled = true;
+  scanButton.textContent = "Scanning...";
+  countEl.textContent = total > 0 ? `${done} / ${total}` : "…";
+  subtextEl.textContent = "scanning your inbox...";
+  badgeEl.style.display = "none";
+  lastScannedEl.textContent = "";
+}
+
+async function init() {
+  const { scanProgress } = await chrome.storage.local.get("scanProgress");
+  if (scanProgress?.running) {
+    showScanningState(scanProgress.done, scanProgress.total);
+  } else {
+    await loadCached();
+    if (scanProgress?.error) {
+      subtextEl.textContent = `Scan failed: ${scanProgress.error}`;
+    }
+  }
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+
+  if (changes.scanProgress) {
+    const progress = changes.scanProgress.newValue;
+    if (progress?.running) {
+      showScanningState(progress.done, progress.total);
+    } else if (progress?.error) {
+      scanButton.disabled = false;
+      scanButton.textContent = "Scan my inbox";
+      countEl.textContent = "—";
+      subtextEl.textContent = `Scan failed: ${progress.error}`;
+    }
+  }
+
+  if (changes.scanCache) {
+    const cache = changes.scanCache.newValue;
+    if (cache) {
+      scanButton.disabled = false;
+      renderDigest(cache.aggregated, cache.scannedAt);
+    }
+  }
+});
+
 function showDigest() {
   reviewView.classList.add("hidden");
   digestView.classList.remove("hidden");
@@ -57,19 +107,23 @@ function showReview() {
 }
 
 scanButton.addEventListener("click", async () => {
-  const hasCached = countEl.textContent !== "—" && countEl.textContent !== "0";
+  const hasCached = countEl.textContent !== "—" && countEl.textContent !== "0" && !scanButton.disabled;
   if (hasCached) {
     showReview();
     loadReview();
     return;
   }
+  // Immediate feedback before the first storage.onChanged write lands;
+  // chrome.storage.onChanged above is what keeps this in sync from
+  // here on, including after the panel is closed and reopened.
   scanButton.disabled = true;
   scanButton.textContent = "Scanning...";
   const result = await sendMessage({ type: "SCAN" });
-  scanButton.disabled = false;
   if (result.ok) {
+    scanButton.disabled = false;
     renderDigest(result.aggregated, result.scannedAt);
-  } else {
+  } else if (result.error !== "A scan is already in progress.") {
+    scanButton.disabled = false;
     subtextEl.textContent = `Scan failed: ${result.error}`;
     scanButton.textContent = "Scan my inbox";
   }
@@ -150,4 +204,4 @@ confirmButton.addEventListener("click", async () => {
   }
 });
 
-loadCached();
+init();

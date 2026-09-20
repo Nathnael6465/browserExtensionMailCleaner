@@ -11,6 +11,18 @@ chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
   .catch((error) => console.error("[MailCleaner] setPanelBehavior failed:", error));
 
+// A stale "running: true" left over from a previous service-worker
+// lifetime (e.g. the extension was reloaded mid-scan) would otherwise
+// make the panel show "Scanning..." forever with nothing actually
+// running to finish it — reset on every fresh service-worker start.
+chrome.storage.local.set({ scanProgress: { running: false } });
+
+let scanInProgress = false;
+
+function setScanProgress(progress) {
+  return chrome.storage.local.set({ scanProgress: progress });
+}
+
 function getAuthToken(interactive) {
   return new Promise((resolve, reject) => {
     chrome.identity.getAuthToken({ interactive }, (token) => {
@@ -149,6 +161,7 @@ async function fetchAllHeaders(token, ids, concurrency = 10) {
       done += 1;
       if (done % 20 === 0 || done === ids.length) {
         setBadgeProgress(done, ids.length);
+        setScanProgress({ running: true, done, total: ids.length });
       }
       if (done % 200 === 0 || done === ids.length) {
         console.log(`[MailCleaner] fetched headers for ${done}/${ids.length} messages`);
@@ -172,16 +185,19 @@ async function saveScanCache(aggregated, scannedAt) {
 
 async function runScan() {
   console.log("[MailCleaner] scan starting, requesting token...");
+  await setScanProgress({ running: true, done: 0, total: 0 });
   const token = await getToken();
   console.log("[MailCleaner] got token, listing inbox message ids...");
   const ids = await listInboxMessageIds(token);
   console.log(`[MailCleaner] found ${ids.length} inbox messages, fetching headers...`);
+  await setScanProgress({ running: true, done: 0, total: ids.length });
   const rawMessages = await fetchAllHeaders(token, ids);
   const allowlist = await loadAllowlist();
   const classified = classifyMessages(rawMessages, allowlist);
   const aggregated = aggregateByDomain(classified);
   const scannedAt = new Date().toISOString();
   await saveScanCache(aggregated, scannedAt);
+  await setScanProgress({ running: false, done: ids.length, total: ids.length });
   console.log("[MailCleaner] scan complete and cached.");
   return { aggregated, scannedAt };
 }
@@ -251,17 +267,25 @@ async function executeDomains(domains) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "SCAN") {
+    if (scanInProgress) {
+      sendResponse({ ok: false, error: "A scan is already in progress." });
+      return true;
+    }
+    scanInProgress = true;
     chrome.action.setBadgeBackgroundColor({ color: "#4f7cff" });
     chrome.action.setBadgeText({ text: "..." });
     runScan()
       .then(({ aggregated, scannedAt }) => {
+        scanInProgress = false;
         clearBadge();
         sendResponse({ ok: true, aggregated, scannedAt });
       })
       .catch((error) => {
+        scanInProgress = false;
         console.error("[MailCleaner] scan failed:", error);
         chrome.action.setBadgeBackgroundColor({ color: "#d64545" });
         chrome.action.setBadgeText({ text: "err" });
+        setScanProgress({ running: false, error: error.message });
         sendResponse({ ok: false, error: error.message });
       });
     return true; // keep the message channel open for the async response
