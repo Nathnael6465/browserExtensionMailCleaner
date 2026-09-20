@@ -3,7 +3,7 @@
   "name": "Mail Cleaner",
   "version": "0.1.0",
   "description": "Flags and cleans up untrusted senders in your Gmail inbox.",
-  "permissions": ["identity", "storage"],
+  "permissions": ["identity", "storage", "sidePanel"],
   "oauth2": {
     "client_id": "757803398856-gsqb0i1n5i40c74ap2fbbei5mdi3mh58.apps.googleusercontent.com",
     "scopes": [
@@ -16,7 +16,8 @@
     "service_worker": "src/background.js",
     "type": "module"
   },
-  "action": {
-    "default_popup": "popup.html"
+  "action": {},
+  "side_panel": {
+    "default_path": "sidepanel.html"
   }
 }

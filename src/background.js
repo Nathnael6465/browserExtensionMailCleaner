@@ -4,6 +4,13 @@ import { classifyMessages, aggregateByDomain } from "./aggregate.js";
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 const HEADER_NAMES = ["From", "Subject", "List-Unsubscribe", "List-Unsubscribe-Post", "Authentication-Results"];
 
+// A side panel stays open across tab switches (unlike the ephemeral
+// popup this replaced), so clicking the toolbar icon opens it instead
+// of a popup — no "default_popup" is set in manifest.json anymore.
+chrome.sidePanel
+  .setPanelBehavior({ openPanelOnActionClick: true })
+  .catch((error) => console.error("[MailCleaner] setPanelBehavior failed:", error));
+
 function getAuthToken(interactive) {
   return new Promise((resolve, reject) => {
     chrome.identity.getAuthToken({ interactive }, (token) => {
@@ -43,16 +50,34 @@ function isRateLimitError(status, bodyText) {
   return status === 403 && /rateLimitExceeded|RATE_LIMIT_EXCEEDED/i.test(bodyText);
 }
 
-// Gmail API enforces a per-user quota (units/minute) that a bounded-
-// concurrency scan of a large inbox can trip well before finishing.
-// Google's own guidance for 403/429 quota errors is exponential
-// backoff, not failing the whole request — retry a handful of times
-// before giving up, so a burst above the quota just slows down rather
-// than aborting the entire scan.
+// Gmail's per-user quota is 6000 units/minute, and users.messages.get
+// costs 20 units/call — a sustainable rate of ~300 calls/min (5/sec).
+// Firing the bounded-concurrency worker pool (10 workers) as fast as
+// possible blows through that budget in well under a second, so every
+// request ends up rate-limited rather than an occasional burst. Pace
+// every Gmail API call (list and get both draw from the same
+// per-user budget) through a shared minimum interval so we stay
+// under quota proactively instead of relying on backoff to recover
+// after the fact. 300ms ≈ 3.3 req/sec, comfortably under the ~5/sec
+// ceiling to leave headroom for messages.list's own cost.
+let nextAllowedRequestTime = 0;
+function paceRequest() {
+  const minIntervalMs = 300;
+  const now = Date.now();
+  const wait = Math.max(0, nextAllowedRequestTime - now);
+  nextAllowedRequestTime = Math.max(now, nextAllowedRequestTime) + minIntervalMs;
+  return wait > 0 ? new Promise((resolve) => setTimeout(resolve, wait)) : Promise.resolve();
+}
+
+// Backoff is still needed as a safety net (other tabs/tools sharing
+// the same quota, a burst right at a window boundary), just no longer
+// the primary defense against exceeding it.
 async function gmailFetch(token, path, options = {}) {
-  const maxRetries = 5;
+  const maxRetries = 8;
+  const maxDelay = 60000;
   let delay = 1000;
   for (let attempt = 0; ; attempt++) {
+    await paceRequest();
     const resp = await fetch(`${GMAIL_API}${path}`, {
       ...options,
       headers: { Authorization: `Bearer ${token}`, ...options.headers },
@@ -63,8 +88,10 @@ async function gmailFetch(token, path, options = {}) {
     if (!isRateLimitError(resp.status, bodyText) || attempt >= maxRetries) {
       throw new Error(`Gmail API error ${resp.status}: ${bodyText}`);
     }
-    await new Promise((resolve) => setTimeout(resolve, delay));
-    delay *= 2;
+    const jittered = Math.round(delay * (0.5 + Math.random()));
+    console.log(`[MailCleaner] rate limited, retrying in ${jittered}ms (attempt ${attempt + 1}/${maxRetries})`);
+    await new Promise((resolve) => setTimeout(resolve, jittered));
+    delay = Math.min(delay * 2, maxDelay);
   }
 }
 
@@ -88,15 +115,44 @@ async function fetchMessageHeaders(token, id) {
   return adaptGmailMessage(message);
 }
 
+// The popup closes the instant it loses focus (standard, unavoidable
+// Chrome behavior for every extension popup), so it can't show live
+// progress on its own for a scan that runs for tens of minutes. The
+// toolbar badge is the one UI surface Chrome keeps visible regardless
+// of whether the popup is open — use it to show how far along a scan
+// is. Badge text is only ~4 characters wide before Chrome starts
+// clipping it, so large counts get abbreviated (e.g. 9411 -> "9.4k").
+function formatBadgeCount(n) {
+  if (n < 1000) return String(n);
+  return `${Math.floor(n / 100) / 10}k`;
+}
+
+function setBadgeProgress(done, total) {
+  chrome.action.setBadgeBackgroundColor({ color: "#4f7cff" });
+  chrome.action.setBadgeText({ text: `${formatBadgeCount(done)}/${formatBadgeCount(total)}` });
+}
+
+function clearBadge() {
+  chrome.action.setBadgeText({ text: "" });
+}
+
 // Bounded concurrency — fetch several messages' headers in parallel
 // without overwhelming the Gmail API's per-second quota.
 async function fetchAllHeaders(token, ids, concurrency = 10) {
   const results = [];
   let index = 0;
+  let done = 0;
   async function worker() {
     while (index < ids.length) {
       const i = index++;
       results[i] = await fetchMessageHeaders(token, ids[i]);
+      done += 1;
+      if (done % 20 === 0 || done === ids.length) {
+        setBadgeProgress(done, ids.length);
+      }
+      if (done % 200 === 0 || done === ids.length) {
+        console.log(`[MailCleaner] fetched headers for ${done}/${ids.length} messages`);
+      }
     }
   }
   await Promise.all(Array.from({ length: concurrency }, worker));
@@ -115,14 +171,18 @@ async function saveScanCache(aggregated, scannedAt) {
 }
 
 async function runScan() {
+  console.log("[MailCleaner] scan starting, requesting token...");
   const token = await getToken();
+  console.log("[MailCleaner] got token, listing inbox message ids...");
   const ids = await listInboxMessageIds(token);
+  console.log(`[MailCleaner] found ${ids.length} inbox messages, fetching headers...`);
   const rawMessages = await fetchAllHeaders(token, ids);
   const allowlist = await loadAllowlist();
   const classified = classifyMessages(rawMessages, allowlist);
   const aggregated = aggregateByDomain(classified);
   const scannedAt = new Date().toISOString();
   await saveScanCache(aggregated, scannedAt);
+  console.log("[MailCleaner] scan complete and cached.");
   return { aggregated, scannedAt };
 }
 
@@ -191,9 +251,19 @@ async function executeDomains(domains) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "SCAN") {
+    chrome.action.setBadgeBackgroundColor({ color: "#4f7cff" });
+    chrome.action.setBadgeText({ text: "..." });
     runScan()
-      .then(({ aggregated, scannedAt }) => sendResponse({ ok: true, aggregated, scannedAt }))
-      .catch((error) => sendResponse({ ok: false, error: error.message }));
+      .then(({ aggregated, scannedAt }) => {
+        clearBadge();
+        sendResponse({ ok: true, aggregated, scannedAt });
+      })
+      .catch((error) => {
+        console.error("[MailCleaner] scan failed:", error);
+        chrome.action.setBadgeBackgroundColor({ color: "#d64545" });
+        chrome.action.setBadgeText({ text: "err" });
+        sendResponse({ ok: false, error: error.message });
+      });
     return true; // keep the message channel open for the async response
   }
 
