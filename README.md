@@ -25,3 +25,13 @@ npm test
 2. Click "Load unpacked", select this directory.
 3. See the spec's OAuth setup section for connecting a Google Cloud
    project before the extension can authenticate.
+
+## OAuth setup (one-time, per developer)
+
+The Google Cloud OAuth client ID is tied to your specific extension ID,
+which Chrome assigns when you load the extension unpacked — so you
+need your own Google Cloud project, not a shared one. See Task 5 in
+`docs/superpowers/plans/2026-09-19-v1-implementation.md` for exact
+steps. Keep "Publishing status" on **Testing** — add your own Gmail
+test account under "Test users" — no Google verification review is
+needed for personal use.
