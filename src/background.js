@@ -14,20 +14,38 @@ chrome.sidePanel
 // Scans now run as a chain of short chunks woken by chrome.alarms
 // (see runScan-related functions below), so the service worker
 // restarting between chunks is NORMAL and happens every ~30s during
-// any real scan — it must NOT be treated as "the scan died". Only
-// reset progress when a scan is truly orphaned: scanState still says
-// "fetching" but no "continueScan" alarm is scheduled to resume it
-// (e.g. the extension was reloaded mid-scan, which does clear alarms).
+// any real scan — it must NOT be treated as "the scan died".
+//
+// scanState is the single source of truth for whether a scan is
+// actually in flight; scanProgress.running is a derived UI flag that
+// must always agree with it. A real incident showed why this matters:
+// an older crash (before scanState even existed) left scanProgress
+// stuck at running:true with no scanState at all, and reloading the
+// extension doesn't clear chrome.storage.local — that stale flag
+// survived every reload afterward and permanently disabled the scan
+// button, since the panel trusts scanProgress.running to decide
+// whether a scan is already running. Reconcile on every worker boot
+// so any future crash, of any shape, can't leave that same trap
+// behind: scanState says "fetching" and something is actually
+// scheduled to resume it, or scanProgress.running must be false.
 (async () => {
-  const [{ scanState }, alarm] = await Promise.all([
-    chrome.storage.local.get("scanState"),
+  const [{ scanState, scanProgress }, alarm] = await Promise.all([
+    chrome.storage.local.get(["scanState", "scanProgress"]),
     chrome.alarms.get("continueScan"),
   ]);
+
   if (scanState?.phase === "fetching" && !alarm) {
+    // A scan was mid-flight but nothing is scheduled to resume it
+    // (e.g. the extension was reloaded mid-scan, which clears alarms).
     await chrome.storage.local.set({
       scanState: { phase: "idle" },
       scanProgress: { running: false, error: "Scan was interrupted and could not resume." },
     });
+    clearBadge();
+  } else if (scanState?.phase !== "fetching" && scanProgress?.running) {
+    // scanProgress claims a scan is running but scanState doesn't back
+    // that up at all — drift with no legitimate in-flight scan behind it.
+    await chrome.storage.local.set({ scanProgress: { running: false } });
     clearBadge();
   }
 })();
