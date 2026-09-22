@@ -11,13 +11,26 @@ chrome.sidePanel
   .setPanelBehavior({ openPanelOnActionClick: true })
   .catch((error) => console.error("[MailCleaner] setPanelBehavior failed:", error));
 
-// A stale "running: true" left over from a previous service-worker
-// lifetime (e.g. the extension was reloaded mid-scan) would otherwise
-// make the panel show "Scanning..." forever with nothing actually
-// running to finish it — reset on every fresh service-worker start.
-chrome.storage.local.set({ scanProgress: { running: false } });
-
-let scanInProgress = false;
+// Scans now run as a chain of short chunks woken by chrome.alarms
+// (see runScan-related functions below), so the service worker
+// restarting between chunks is NORMAL and happens every ~30s during
+// any real scan — it must NOT be treated as "the scan died". Only
+// reset progress when a scan is truly orphaned: scanState still says
+// "fetching" but no "continueScan" alarm is scheduled to resume it
+// (e.g. the extension was reloaded mid-scan, which does clear alarms).
+(async () => {
+  const [{ scanState }, alarm] = await Promise.all([
+    chrome.storage.local.get("scanState"),
+    chrome.alarms.get("continueScan"),
+  ]);
+  if (scanState?.phase === "fetching" && !alarm) {
+    await chrome.storage.local.set({
+      scanState: { phase: "idle" },
+      scanProgress: { running: false, error: "Scan was interrupted and could not resume." },
+    });
+    clearBadge();
+  }
+})();
 
 function setScanProgress(progress) {
   return chrome.storage.local.set({ scanProgress: progress });
@@ -159,30 +172,6 @@ function clearBadge() {
   chrome.action.setBadgeText({ text: "" });
 }
 
-// Bounded concurrency — fetch several messages' headers in parallel
-// without overwhelming the Gmail API's per-second quota.
-async function fetchAllHeaders(token, ids, concurrency = 10) {
-  const results = [];
-  let index = 0;
-  let done = 0;
-  async function worker() {
-    while (index < ids.length) {
-      const i = index++;
-      results[i] = await fetchMessageHeaders(token, ids[i]);
-      done += 1;
-      if (done % 20 === 0 || done === ids.length) {
-        setBadgeProgress(done, ids.length);
-        setScanProgress({ running: true, done, total: ids.length });
-      }
-      if (done % 200 === 0 || done === ids.length) {
-        console.log(`[MailCleaner] fetched headers for ${done}/${ids.length} messages`);
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: concurrency }, worker));
-  return results;
-}
-
 async function loadAllowlist() {
   const { allowlist } = await chrome.storage.sync.get("allowlist");
   return new Set(allowlist ?? []);
@@ -194,24 +183,89 @@ async function saveScanCache(aggregated, scannedAt) {
   });
 }
 
-async function runScan() {
-  console.log("[MailCleaner] scan starting, requesting token...");
-  await setScanProgress({ running: true, done: 0, total: 0 });
+// Manifest V3 service workers can be torn down after ~30s of no
+// activity, and a scan over a large inbox can legitimately take
+// 20-40+ minutes — far too long to run inside one continuous
+// invocation regardless of how tightly individual waits are capped
+// (tried and confirmed insufficient: capping gmailFetch's backoff
+// delay still let the worker die near the tail of a real scan).
+// chrome.alarms is the documented, durable way to run a long task in
+// an MV3 worker: alarms persist independently of the worker's own
+// lifetime, so each "continueScan" firing gets a fresh worker
+// instance that reads where the last chunk left off (in
+// chrome.storage.local) and picks up from there. A chunk processes
+// for a fixed wall-clock budget, well under the alarm interval, then
+// yields by scheduling the next alarm — so the worker is never asked
+// to stay alive longer than one short chunk at a time.
+const CHUNK_BUDGET_MS = 15000;
+const ALARM_INTERVAL_MINUTES = 0.5; // 30s — Chrome's practical minimum for one-time alarms
+
+async function startOrResumeScan() {
+  let { scanState } = await chrome.storage.local.get("scanState");
+
+  if (!scanState || scanState.phase !== "fetching") {
+    console.log("[MailCleaner] scan starting, requesting token...");
+    await setScanProgress({ running: true, done: 0, total: 0 });
+    const token = await getToken();
+    console.log("[MailCleaner] got token, listing inbox message ids...");
+    const ids = await listInboxMessageIds(token);
+    console.log(`[MailCleaner] found ${ids.length} inbox messages, fetching headers...`);
+    scanState = { phase: "fetching", ids, nextIndex: 0, results: [] };
+    await chrome.storage.local.set({ scanState });
+    await setScanProgress({ running: true, done: 0, total: ids.length });
+  }
+
+  await processScanChunk();
+}
+
+async function processScanChunk() {
+  const { scanState } = await chrome.storage.local.get("scanState");
+  if (!scanState || scanState.phase !== "fetching") return;
+
   const token = await getToken();
-  console.log("[MailCleaner] got token, listing inbox message ids...");
-  const ids = await listInboxMessageIds(token);
-  console.log(`[MailCleaner] found ${ids.length} inbox messages, fetching headers...`);
-  await setScanProgress({ running: true, done: 0, total: ids.length });
-  const rawMessages = await fetchAllHeaders(token, ids);
+  const { ids, results } = scanState;
+  let { nextIndex } = scanState;
+  const chunkStart = Date.now();
+
+  while (nextIndex < ids.length && Date.now() - chunkStart < CHUNK_BUDGET_MS) {
+    results.push(await fetchMessageHeaders(token, ids[nextIndex]));
+    nextIndex += 1;
+  }
+
+  await chrome.storage.local.set({ scanState: { phase: "fetching", ids, nextIndex, results } });
+  setBadgeProgress(nextIndex, ids.length);
+  await setScanProgress({ running: true, done: nextIndex, total: ids.length });
+  console.log(`[MailCleaner] fetched headers for ${nextIndex}/${ids.length} messages`);
+
+  if (nextIndex < ids.length) {
+    chrome.alarms.create("continueScan", { delayInMinutes: ALARM_INTERVAL_MINUTES });
+  } else {
+    await finishScan(results, ids.length);
+  }
+}
+
+async function finishScan(rawMessages, total) {
   const allowlist = await loadAllowlist();
   const classified = classifyMessages(rawMessages, allowlist);
   const aggregated = aggregateByDomain(classified);
   const scannedAt = new Date().toISOString();
   await saveScanCache(aggregated, scannedAt);
-  await setScanProgress({ running: false, done: ids.length, total: ids.length });
+  await chrome.storage.local.set({ scanState: { phase: "idle" } });
+  await setScanProgress({ running: false, done: total, total });
+  clearBadge();
   console.log("[MailCleaner] scan complete and cached.");
-  return { aggregated, scannedAt };
 }
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== "continueScan") return;
+  processScanChunk().catch((error) => {
+    console.error("[MailCleaner] scan chunk failed:", error);
+    chrome.action.setBadgeBackgroundColor({ color: "#d64545" });
+    chrome.action.setBadgeText({ text: "err" });
+    setScanProgress({ running: false, error: error.message });
+    chrome.storage.local.set({ scanState: { phase: "idle" } });
+  });
+});
 
 async function trustSender(domain) {
   const allowlist = await loadAllowlist();
@@ -278,27 +332,29 @@ async function executeDomains(domains) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "SCAN") {
-    if (scanInProgress) {
-      sendResponse({ ok: false, error: "A scan is already in progress." });
-      return true;
-    }
-    scanInProgress = true;
-    chrome.action.setBadgeBackgroundColor({ color: "#4f7cff" });
-    chrome.action.setBadgeText({ text: "..." });
-    runScan()
-      .then(({ aggregated, scannedAt }) => {
-        scanInProgress = false;
-        clearBadge();
-        sendResponse({ ok: true, aggregated, scannedAt });
-      })
-      .catch((error) => {
-        scanInProgress = false;
-        console.error("[MailCleaner] scan failed:", error);
-        chrome.action.setBadgeBackgroundColor({ color: "#d64545" });
-        chrome.action.setBadgeText({ text: "err" });
-        setScanProgress({ running: false, error: error.message });
-        sendResponse({ ok: false, error: error.message });
-      });
+    // A scan now spans many separate alarm-triggered worker
+    // invocations, so "already running" has to be checked against
+    // persisted state, not an in-memory flag — the flag would reset
+    // to false every time the worker restarts between chunks, which
+    // happens by design roughly every 30s during a real scan.
+    chrome.storage.local.get("scanState").then(({ scanState }) => {
+      if (scanState?.phase === "fetching") {
+        sendResponse({ ok: false, error: "A scan is already in progress." });
+        return;
+      }
+      chrome.action.setBadgeBackgroundColor({ color: "#4f7cff" });
+      chrome.action.setBadgeText({ text: "..." });
+      startOrResumeScan()
+        .then(() => sendResponse({ ok: true, started: true }))
+        .catch((error) => {
+          console.error("[MailCleaner] scan failed:", error);
+          chrome.action.setBadgeBackgroundColor({ color: "#d64545" });
+          chrome.action.setBadgeText({ text: "err" });
+          setScanProgress({ running: false, error: error.message });
+          chrome.storage.local.set({ scanState: { phase: "idle" } });
+          sendResponse({ ok: false, error: error.message });
+        });
+    });
     return true; // keep the message channel open for the async response
   }
 
