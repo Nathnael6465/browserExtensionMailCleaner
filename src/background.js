@@ -70,8 +70,14 @@ async function getToken() {
   }
 }
 
-function isRateLimitError(status, bodyText) {
+// Gmail's own API guidance calls for exponential-backoff retry on 5xx
+// responses (transient backend errors, not just quota) in addition to
+// 429/403 rate limiting — a bare 500 "Unknown Error" is common on a
+// large scan and previously wasn't retried at all, so it aborted the
+// whole scan instead of recovering like a rate limit does.
+function isRetryableError(status, bodyText) {
   if (status === 429) return true;
+  if (status === 500 || status === 502 || status === 503 || status === 504) return true;
   return status === 403 && /rateLimitExceeded|RATE_LIMIT_EXCEEDED/i.test(bodyText);
 }
 
@@ -121,11 +127,11 @@ async function gmailFetch(token, path, options = {}) {
     if (resp.ok) return resp.json();
 
     const bodyText = await resp.text();
-    if (!isRateLimitError(resp.status, bodyText) || attempt >= maxRetries) {
+    if (!isRetryableError(resp.status, bodyText) || attempt >= maxRetries) {
       throw new Error(`Gmail API error ${resp.status}: ${bodyText}`);
     }
     const jittered = Math.round(delay * (0.5 + Math.random()));
-    console.log(`[MailCleaner] rate limited, retrying in ${jittered}ms (attempt ${attempt + 1}/${maxRetries})`);
+    console.log(`[MailCleaner] retryable error ${resp.status}, retrying in ${jittered}ms (attempt ${attempt + 1}/${maxRetries})`);
     await new Promise((resolve) => setTimeout(resolve, jittered));
     delay = Math.min(delay * 2, maxDelay);
   }
@@ -256,15 +262,29 @@ async function finishScan(rawMessages, total) {
   console.log("[MailCleaner] scan complete and cached.");
 }
 
+// A chunk failure after gmailFetch's own retries are exhausted (e.g. a
+// persistent 500) used to reset scanState to idle unconditionally,
+// which threw away every message already fetched and forced a full
+// restart from message 0 on a scan that can take tens of minutes.
+// Once ids/nextIndex/results exist in scanState (phase "fetching"),
+// keep them — no further alarm fires, so the scan is now orphaned
+// exactly like a reload-mid-scan, and the next "Scan" click's
+// startOrResumeScan() picks up at the same nextIndex instead of
+// re-listing and re-fetching everything.
+async function handleScanChunkFailure(error) {
+  console.error("[MailCleaner] scan chunk failed:", error);
+  chrome.action.setBadgeBackgroundColor({ color: "#d64545" });
+  chrome.action.setBadgeText({ text: "err" });
+  const { scanState } = await chrome.storage.local.get("scanState");
+  await setScanProgress({ running: false, error: error.message, resumable: scanState?.phase === "fetching" });
+  if (scanState?.phase !== "fetching") {
+    await chrome.storage.local.set({ scanState: { phase: "idle" } });
+  }
+}
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== "continueScan") return;
-  processScanChunk().catch((error) => {
-    console.error("[MailCleaner] scan chunk failed:", error);
-    chrome.action.setBadgeBackgroundColor({ color: "#d64545" });
-    chrome.action.setBadgeText({ text: "err" });
-    setScanProgress({ running: false, error: error.message });
-    chrome.storage.local.set({ scanState: { phase: "idle" } });
-  });
+  processScanChunk().catch(handleScanChunkFailure);
 });
 
 async function trustSender(domain) {
@@ -337,24 +357,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // persisted state, not an in-memory flag — the flag would reset
     // to false every time the worker restarts between chunks, which
     // happens by design roughly every 30s during a real scan.
-    chrome.storage.local.get("scanState").then(({ scanState }) => {
-      if (scanState?.phase === "fetching") {
-        sendResponse({ ok: false, error: "A scan is already in progress." });
-        return;
-      }
-      chrome.action.setBadgeBackgroundColor({ color: "#4f7cff" });
-      chrome.action.setBadgeText({ text: "..." });
-      startOrResumeScan()
-        .then(() => sendResponse({ ok: true, started: true }))
-        .catch((error) => {
-          console.error("[MailCleaner] scan failed:", error);
-          chrome.action.setBadgeBackgroundColor({ color: "#d64545" });
-          chrome.action.setBadgeText({ text: "err" });
-          setScanProgress({ running: false, error: error.message });
-          chrome.storage.local.set({ scanState: { phase: "idle" } });
-          sendResponse({ ok: false, error: error.message });
-        });
-    });
+    Promise.all([chrome.storage.local.get("scanState"), chrome.alarms.get("continueScan")]).then(
+      ([{ scanState }, alarm]) => {
+        if (scanState?.phase === "fetching" && alarm) {
+          sendResponse({ ok: false, error: "A scan is already in progress." });
+          return;
+        }
+        chrome.action.setBadgeBackgroundColor({ color: "#4f7cff" });
+        chrome.action.setBadgeText({ text: "..." });
+        startOrResumeScan()
+          .then(() => sendResponse({ ok: true, started: true }))
+          .catch((error) => {
+            handleScanChunkFailure(error);
+            sendResponse({ ok: false, error: error.message });
+          });
+      },
+    );
     return true; // keep the message channel open for the async response
   }
 
