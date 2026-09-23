@@ -72,4 +72,4 @@ same location with a new "Last updated" date.
 ## Contact
 
 Questions about this policy or the extension's data handling can be
-sent to: natehg522@gmail.com
+filed at: https://github.com/Nathnael6465/browserExtensionMailCleaner/issues
