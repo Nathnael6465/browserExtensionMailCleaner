@@ -37,22 +37,39 @@ function isFresh(state) {
   return Boolean(state?.updatedAt) && Date.now() - state.updatedAt < STALE_THRESHOLD_MS;
 }
 
+// A scoped re-review of the first version of this reconciler caught two
+// real bugs, both now fixed here:
+//
+// (1) It wrote {phase: "idle"} on a stale run, discarding the resumable
+// payload (ids/nextIndex/results, or queue/counters/domains) that
+// handleScanChunkFailure/handleExecuteChunkFailure had deliberately
+// preserved for exactly this situation. A panel reopened 3+ minutes
+// after a chunk failure would have the worker boot, see the run as
+// stale, and delete tens of minutes of already-fetched progress that
+// was sitting there waiting to be resumed. Fixed: only ever touch the
+// progress flag here, never the state payload — state stays fully
+// intact and resumable regardless of what this reconciler decides.
+//
+// (2) On a boot caused by a delayed alarm (machine slept, Chrome
+// restarted — alarms persist and fire late), this reconciler and the
+// onAlarm-triggered chunk processor both ran unordered against the same
+// storage keys, an unserialized race on the exact keys this reconciler
+// exists to protect. Fixed: both onAlarm handlers below now await this
+// promise before their first storage read, so reconciliation always
+// completes first — deterministic ordering instead of a race.
 async function reconcileRunState(stateKey, progressKey, activePhase, interruptedMessage) {
   const stored = await chrome.storage.local.get([stateKey, progressKey]);
   const state = stored[stateKey];
   const progress = stored[progressKey];
 
   if (state?.phase === activePhase && !isFresh(state)) {
-    await chrome.storage.local.set({
-      [stateKey]: { phase: "idle" },
-      [progressKey]: { running: false, error: interruptedMessage },
-    });
-    clearBadge();
+    await chrome.storage.local.set({ [progressKey]: { running: false, error: interruptedMessage } });
+    if (stateKey === "scanState") clearBadge(); // the badge only ever reflects scan progress
   } else if (state?.phase !== activePhase && progress?.running) {
     // progress claims something is running but state doesn't back that up
     // at all — drift with no legitimate in-flight run behind it.
     await chrome.storage.local.set({ [progressKey]: { running: false } });
-    clearBadge();
+    if (stateKey === "scanState") clearBadge();
   }
 }
 
@@ -62,10 +79,14 @@ async function reconcileRunState(stateKey, progressKey, activePhase, interrupted
 // while scanProgress.running is stuck stale (e.g. the worker died between
 // chunks with nothing left to wake it) would show "Scanning..." forever
 // without ever causing the worker to boot and clean that state up.
+//
+// Never rejects (caught internally) — an unhandled rejection here would
+// leave every future PING hanging forever, since its handler only
+// resolves after this promise settles.
 const reconcileOnBoot = (async () => {
   await reconcileRunState("scanState", "scanProgress", "fetching", "Scan was interrupted and could not resume.");
   await reconcileRunState("executeState", "executeProgress", "running", "Clean was interrupted and could not resume.");
-})();
+})().catch((error) => console.error("[MailCleaner] boot reconciliation failed:", error));
 
 function setProgress(key, progress) {
   return chrome.storage.local.set({ [key]: progress });
@@ -369,10 +390,24 @@ async function handleScanChunkFailure(error) {
   await setProgress("scanProgress", { running: false, error: error.message });
 }
 
+// A resume that blindly continued executeState.queue regardless of the
+// domains actually being requested had a real path to trashing messages
+// from a domain the user had just deselected: a failed clean leaves
+// executeState.phase "running" (so it can resume) but re-enables the
+// Clean button; if the user then unchecks a domain and clicks Clean
+// again before that stale phase gets cleared, the OLD queue (built from
+// the ORIGINAL selection) would keep running, ignoring the new one
+// entirely. Only resume when the requested domains match what's already
+// queued — any other selection starts fresh.
+function sameDomainSelection(a, b) {
+  return Array.isArray(a) && a.length === b.length && a.every((d) => b.includes(d));
+}
+
 async function startOrResumeExecute(domains) {
   let { executeState } = await chrome.storage.local.get("executeState");
+  const canResume = executeState?.phase === "running" && sameDomainSelection(executeState.domains, domains);
 
-  if (!executeState || executeState.phase !== "running") {
+  if (!canResume) {
     const { scanCache } = await chrome.storage.local.get("scanCache");
     if (!scanCache) throw new Error("No cached scan to execute against — run a scan first.");
     const queue = [];
@@ -387,6 +422,7 @@ async function startOrResumeExecute(domains) {
       nextIndex: 0,
       trashedCount: 0,
       unsubscribedCount: 0,
+      failedDomains: [],
       domains,
       updatedAt: Date.now(),
     };
@@ -409,6 +445,13 @@ async function processExecuteChunk() {
   const token = await getToken();
   const { queue } = executeState;
   let { nextIndex, trashedCount, unsubscribedCount } = executeState;
+  // A message that fails even after gmailFetch's own retries (e.g. a
+  // sustained outage, not just an already-deleted message) must not be
+  // silently reported as cleaned — track which domains had a failure so
+  // finishExecute can leave them in the cache/review list instead of
+  // telling the user everything succeeded while some messages actually
+  // stayed in the inbox.
+  const failedDomains = new Set(executeState.failedDomains || []);
   const chunkStart = Date.now();
   let lastFlush = chunkStart;
 
@@ -421,27 +464,28 @@ async function processExecuteChunk() {
         return result.succeeded;
       }),
     );
-    for (const outcome of settled) {
+    settled.forEach((outcome, i) => {
       if (outcome.status === "fulfilled") {
         trashedCount += 1;
         if (outcome.value) unsubscribedCount += 1;
       } else {
         console.warn("[MailCleaner] skipping a message during clean after error:", outcome.reason?.message);
+        failedDomains.add(batch[i].domain);
       }
-    }
+    });
     nextIndex += batch.length;
 
     const now = Date.now();
     if (now - lastFlush >= FLUSH_INTERVAL_MS) {
       await chrome.storage.local.set({
-        executeState: { ...executeState, nextIndex, trashedCount, unsubscribedCount, updatedAt: now },
+        executeState: { ...executeState, nextIndex, trashedCount, unsubscribedCount, failedDomains: [...failedDomains], updatedAt: now },
       });
       await setProgress("executeProgress", { running: true, done: nextIndex, total: queue.length });
       lastFlush = now;
     }
   }
 
-  const finalState = { ...executeState, nextIndex, trashedCount, unsubscribedCount, updatedAt: Date.now() };
+  const finalState = { ...executeState, nextIndex, trashedCount, unsubscribedCount, failedDomains: [...failedDomains], updatedAt: Date.now() };
   await chrome.storage.local.set({ executeState: finalState });
   await setProgress("executeProgress", { running: true, done: nextIndex, total: queue.length });
 
@@ -453,13 +497,16 @@ async function processExecuteChunk() {
 }
 
 async function finishExecute(executeState) {
-  await removeDomainsFromScanCache(executeState.domains);
+  const failedDomains = executeState.failedDomains || [];
+  const cleanedDomains = executeState.domains.filter((d) => !failedDomains.includes(d));
+  await removeDomainsFromScanCache(cleanedDomains);
   await chrome.storage.local.set({
     executeState: { phase: "idle" },
     executeResult: {
       trashedCount: executeState.trashedCount,
       unsubscribedCount: executeState.unsubscribedCount,
-      domains: executeState.domains,
+      domains: cleanedDomains,
+      failedDomains,
       completedAt: Date.now(),
     },
   });
@@ -474,9 +521,9 @@ async function handleExecuteChunkFailure(error) {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "continueScan") {
-    processScanChunk().catch(handleScanChunkFailure);
+    reconcileOnBoot.then(() => processScanChunk()).catch(handleScanChunkFailure);
   } else if (alarm.name === "continueExecute") {
-    processExecuteChunk().catch(handleExecuteChunkFailure);
+    reconcileOnBoot.then(() => processExecuteChunk()).catch(handleExecuteChunkFailure);
   }
 });
 
@@ -587,6 +634,26 @@ async function trashMessage(token, id) {
   await gmailFetch(token, `/messages/${id}/trash`, { method: "POST" });
 }
 
+// A scoped re-review caught a real concurrency hole: startOrResumeScan
+// writes scanProgress.running = true well before it writes
+// scanState.phase = "fetching" (getToken()/listInboxMessageIds() sit in
+// between, which can take minutes on a large mailbox) — so the SCAN
+// handler's AND-based "already running" check was false for that whole
+// window, letting a second SCAN message (a double-click on the never-
+// disabled rescan link, or a second side panel window) start a fully
+// concurrent second scan chain. Two chunk loops racing to overwrite the
+// same scanState silently drop half the fetched results.
+//
+// chrome.runtime.onMessage listener invocations run synchronously up to
+// their first await, and all messages for one extension are delivered
+// to the same single worker instance — so a plain in-memory flag, set
+// synchronously before any storage read, is race-free here (unlike the
+// storage-based check it backs up, which stays as defense in depth for
+// the case this flag can't cover: a resume triggered by something other
+// than this listener, e.g. the alarm path above).
+let scanStarting = false;
+let executeStarting = false;
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "PING") {
     reconcileOnBoot.then(() => sendResponse({ ok: true }));
@@ -594,8 +661,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "SCAN") {
+    if (scanStarting) {
+      sendResponse({ ok: false, error: "A scan is already in progress." });
+      return true;
+    }
+    scanStarting = true;
     chrome.storage.local.get(["scanState", "scanProgress"]).then(({ scanState, scanProgress }) => {
       if (scanState?.phase === "fetching" && scanProgress?.running) {
+        scanStarting = false;
         sendResponse({ ok: false, error: "A scan is already in progress." });
         return;
       }
@@ -606,7 +679,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch((error) => {
           handleScanChunkFailure(error);
           sendResponse({ ok: false, error: error.message });
-        });
+        })
+        .finally(() => { scanStarting = false; });
     });
     return true; // keep the message channel open for the async response
   }
@@ -624,8 +698,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "EXECUTE") {
+    if (executeStarting) {
+      sendResponse({ ok: false, error: "A clean is already in progress." });
+      return true;
+    }
+    executeStarting = true;
     chrome.storage.local.get(["executeState", "executeProgress"]).then(({ executeState, executeProgress }) => {
       if (executeState?.phase === "running" && executeProgress?.running) {
+        executeStarting = false;
         sendResponse({ ok: false, error: "A clean is already in progress." });
         return;
       }
@@ -634,7 +714,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch((error) => {
           handleExecuteChunkFailure(error);
           sendResponse({ ok: false, error: error.message });
-        });
+        })
+        .finally(() => { executeStarting = false; });
     });
     return true;
   }

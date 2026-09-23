@@ -62,7 +62,12 @@ function renderDigest(aggregated, scannedAt) {
 
 async function loadCached() {
   const cached = await sendMessage({ type: "GET_CACHED_SCAN" });
-  if (cached) renderDigest(cached.aggregated, cached.scannedAt);
+  // sendMessage() resolves an {ok:false, error} sentinel (not undefined)
+  // when the worker died mid-response, which is truthy — checking
+  // `cached.aggregated` specifically (rather than just `cached`) avoids
+  // treating that sentinel as a real cache and crashing on
+  // Object.values(undefined).
+  if (cached?.aggregated) renderDigest(cached.aggregated, cached.scannedAt);
 }
 
 // The panel can be closed and reopened at any point during a scan that
@@ -137,7 +142,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
     const result = changes.executeResult.newValue;
     if (result) {
       confirmButton.disabled = false;
-      statusEl.textContent = `Done — ${result.trashedCount} messages moved to Trash, ${result.unsubscribedCount} unsubscribed.`;
+      const failedNote = result.failedDomains?.length
+        ? ` ${result.failedDomains.length} sender(s) had errors and are still listed to retry.`
+        : "";
+      statusEl.textContent = `Done — ${result.trashedCount} messages moved to Trash, ${result.unsubscribedCount} unsubscribed.${failedNote}`;
+      // Domains that failed stay in scanCache (see finishExecute) and
+      // must stay visible in the review list too — only remove rows for
+      // domains that were actually fully cleaned.
       for (const domain of result.domains) {
         listEl.querySelector(`.row[data-domain="${CSS.escape(domain)}"]`)?.remove();
       }
@@ -247,7 +258,7 @@ async function loadReview() {
   listEl.textContent = "";
   statusEl.textContent = "";
   const cached = await sendMessage({ type: "GET_CACHED_SCAN" });
-  if (!cached) {
+  if (!cached?.aggregated) {
     listEl.textContent = "No scan results yet.";
     return;
   }
