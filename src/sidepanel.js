@@ -9,6 +9,7 @@ const scanButton = document.getElementById("scanButton");
 const rescanButton = document.getElementById("rescanButton");
 
 const backButton = document.getElementById("backButton");
+const selectAllCheckbox = document.getElementById("selectAllCheckbox");
 const listEl = document.getElementById("list");
 const confirmButton = document.getElementById("confirmButton");
 const statusEl = document.getElementById("status");
@@ -145,6 +146,20 @@ rescanButton.addEventListener("click", triggerScan);
 
 backButton.addEventListener("click", showDigest);
 
+function updateSelectAllState() {
+  const checkboxes = [...listEl.querySelectorAll(".row input[type=checkbox]")];
+  const checkedCount = checkboxes.filter((c) => c.checked).length;
+  selectAllCheckbox.checked = checkboxes.length > 0 && checkedCount === checkboxes.length;
+  selectAllCheckbox.indeterminate = checkedCount > 0 && checkedCount < checkboxes.length;
+}
+
+selectAllCheckbox.addEventListener("change", () => {
+  for (const checkbox of listEl.querySelectorAll(".row input[type=checkbox]")) {
+    checkbox.checked = selectAllCheckbox.checked;
+  }
+  selectAllCheckbox.indeterminate = false;
+});
+
 function renderRow(domain, entry) {
   const row = document.createElement("div");
   row.className = "row";
@@ -154,6 +169,7 @@ function renderRow(domain, entry) {
   checkbox.type = "checkbox";
   checkbox.checked = true;
   checkbox.style.marginRight = "10px";
+  checkbox.addEventListener("change", updateSelectAllState);
 
   const info = document.createElement("div");
   info.className = "info";
@@ -174,6 +190,7 @@ function renderRow(domain, entry) {
   trustButton.addEventListener("click", async () => {
     await sendMessage({ type: "TRUST_SENDER", domain });
     row.remove();
+    updateSelectAllState();
   });
 
   row.append(checkbox, info, trustButton);
@@ -191,6 +208,8 @@ async function loadReview() {
   for (const [domain, entry] of Object.entries(cached.aggregated)) {
     listEl.appendChild(renderRow(domain, entry));
   }
+  selectAllCheckbox.checked = true;
+  selectAllCheckbox.indeterminate = false;
 }
 
 confirmButton.addEventListener("click", async () => {
@@ -213,6 +232,7 @@ confirmButton.addEventListener("click", async () => {
     for (const domain of checkedDomains) {
       listEl.querySelector(`.row[data-domain="${CSS.escape(domain)}"]`)?.remove();
     }
+    updateSelectAllState();
   } else {
     statusEl.textContent = `Failed: ${result.error}`;
   }
