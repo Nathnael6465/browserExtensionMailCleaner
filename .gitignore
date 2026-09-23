@@ -1,2 +1,5 @@
+node_modules/
+.DS_Store
+*.log
 .worktrees/
 v1-implementation-EXTENSION
