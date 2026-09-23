@@ -3,3 +3,4 @@ node_modules/
 *.log
 .worktrees/
 v1-implementation-EXTENSION
+*.zip
