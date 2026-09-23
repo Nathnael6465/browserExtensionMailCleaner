@@ -6,6 +6,7 @@ const subtextEl = document.getElementById("subtext");
 const badgeEl = document.getElementById("badge");
 const lastScannedEl = document.getElementById("lastScanned");
 const scanButton = document.getElementById("scanButton");
+const rescanButton = document.getElementById("rescanButton");
 
 const backButton = document.getElementById("backButton");
 const listEl = document.getElementById("list");
@@ -39,6 +40,11 @@ function renderDigest(aggregated, scannedAt) {
 
   lastScannedEl.textContent = scannedAt ? `Last scanned ${new Date(scannedAt).toLocaleString()}` : "";
   scanButton.textContent = totalMessages > 0 ? "Review & clean" : "Scan my inbox";
+  // Once a scan has completed, the main button permanently becomes
+  // "Review & clean" (see scanButton's click handler below) — without
+  // this, there was no way to ever trigger another scan again short of
+  // clearing extension storage by hand.
+  rescanButton.style.display = "inline-block";
 }
 
 async function loadCached() {
@@ -58,6 +64,7 @@ function showScanningState(done, total) {
   subtextEl.textContent = "scanning your inbox...";
   badgeEl.style.display = "none";
   lastScannedEl.textContent = "";
+  rescanButton.style.display = "none";
 }
 
 async function init() {
@@ -106,20 +113,14 @@ function showReview() {
   reviewView.classList.remove("hidden");
 }
 
-scanButton.addEventListener("click", async () => {
-  const hasCached = countEl.textContent !== "—" && countEl.textContent !== "0" && !scanButton.disabled;
-  if (hasCached) {
-    showReview();
-    loadReview();
-    return;
-  }
-  // Immediate feedback before the first storage.onChanged write lands;
-  // chrome.storage.onChanged above is what keeps this in sync from
-  // here on, including after the panel is closed and reopened. A scan
-  // now runs as a chain of alarm-triggered chunks, so this response
-  // only confirms the FIRST chunk started, not that the whole scan
-  // finished — the final digest arrives later via the scanCache
-  // storage.onChanged handler above, same as a reopened panel.
+// Immediate feedback before the first storage.onChanged write lands;
+// chrome.storage.onChanged above is what keeps this in sync from here
+// on, including after the panel is closed and reopened. A scan now
+// runs as a chain of alarm-triggered chunks, so this response only
+// confirms the FIRST chunk started, not that the whole scan finished
+// — the final digest arrives later via the scanCache storage.onChanged
+// handler above, same as a reopened panel.
+async function triggerScan() {
   scanButton.disabled = true;
   scanButton.textContent = "Scanning...";
   const result = await sendMessage({ type: "SCAN" });
@@ -128,7 +129,19 @@ scanButton.addEventListener("click", async () => {
     subtextEl.textContent = `Scan failed: ${result.error}`;
     scanButton.textContent = "Scan my inbox";
   }
+}
+
+scanButton.addEventListener("click", () => {
+  const hasCached = countEl.textContent !== "—" && countEl.textContent !== "0" && !scanButton.disabled;
+  if (hasCached) {
+    showReview();
+    loadReview();
+    return;
+  }
+  triggerScan();
 });
+
+rescanButton.addEventListener("click", triggerScan);
 
 backButton.addEventListener("click", showDigest);
 
