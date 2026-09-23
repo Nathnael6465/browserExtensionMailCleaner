@@ -15,7 +15,19 @@ const confirmButton = document.getElementById("confirmButton");
 const statusEl = document.getElementById("status");
 
 function sendMessage(message) {
-  return new Promise((resolve) => chrome.runtime.sendMessage(message, resolve));
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(message, (response) => {
+      // If the service worker died mid-response (or was never there to
+      // receive the message), chrome.runtime.lastError is set and
+      // response is undefined — resolving undefined silently let
+      // callers crash on `result.ok` instead of showing an error.
+      if (chrome.runtime.lastError) {
+        resolve({ ok: false, error: chrome.runtime.lastError.message });
+        return;
+      }
+      resolve(response);
+    });
+  });
 }
 
 function estimateReclaimableMb(aggregated) {
@@ -69,6 +81,13 @@ function showScanningState(done, total) {
 }
 
 async function init() {
+  // Booting the worker here (if it isn't already running) guarantees its
+  // startup reconciliation has finished before any stored progress below
+  // is trusted — without this, a panel reopened after the worker died
+  // between chunks with nothing left to wake it could read a stale
+  // "running: true" and show "Scanning..." forever with no way to clear it.
+  await sendMessage({ type: "PING" });
+
   const { scanProgress } = await chrome.storage.local.get("scanProgress");
   if (scanProgress?.running) {
     showScanningState(scanProgress.done, scanProgress.total);
@@ -100,6 +119,29 @@ chrome.storage.onChanged.addListener((changes, area) => {
     if (cache) {
       scanButton.disabled = false;
       renderDigest(cache.aggregated, cache.scannedAt);
+    }
+  }
+
+  if (changes.executeProgress) {
+    const progress = changes.executeProgress.newValue;
+    if (progress?.running) {
+      confirmButton.disabled = true;
+      statusEl.textContent = progress.total > 0 ? `Cleaning... ${progress.done}/${progress.total}` : "Cleaning...";
+    } else if (progress?.error) {
+      confirmButton.disabled = false;
+      statusEl.textContent = `Failed: ${progress.error}`;
+    }
+  }
+
+  if (changes.executeResult) {
+    const result = changes.executeResult.newValue;
+    if (result) {
+      confirmButton.disabled = false;
+      statusEl.textContent = `Done — ${result.trashedCount} messages moved to Trash, ${result.unsubscribedCount} unsubscribed.`;
+      for (const domain of result.domains) {
+        listEl.querySelector(`.row[data-domain="${CSS.escape(domain)}"]`)?.remove();
+      }
+      updateSelectAllState();
     }
   }
 });
@@ -188,9 +230,13 @@ function renderRow(domain, entry) {
   trustButton.className = "trust";
   trustButton.textContent = "Trust";
   trustButton.addEventListener("click", async () => {
-    await sendMessage({ type: "TRUST_SENDER", domain });
-    row.remove();
-    updateSelectAllState();
+    const result = await sendMessage({ type: "TRUST_SENDER", domain });
+    if (result.ok) {
+      row.remove();
+      updateSelectAllState();
+    } else {
+      statusEl.textContent = `Failed to trust ${domain}: ${result.error}`;
+    }
   });
 
   row.append(checkbox, info, trustButton);
@@ -210,6 +256,16 @@ async function loadReview() {
   }
   selectAllCheckbox.checked = true;
   selectAllCheckbox.indeterminate = false;
+
+  // A clean can run for a long time on a large selection and, like a
+  // scan, keeps going in the background if the panel is closed — reflect
+  // that immediately if the review view is (re)opened mid-clean instead
+  // of showing a blank "Clean selected" as if nothing were happening.
+  const { executeProgress } = await chrome.storage.local.get("executeProgress");
+  if (executeProgress?.running) {
+    confirmButton.disabled = true;
+    statusEl.textContent = executeProgress.total > 0 ? `Cleaning... ${executeProgress.done}/${executeProgress.total}` : "Cleaning...";
+  }
 }
 
 confirmButton.addEventListener("click", async () => {
@@ -224,16 +280,13 @@ confirmButton.addEventListener("click", async () => {
 
   confirmButton.disabled = true;
   statusEl.textContent = "Cleaning...";
+  // A clean now runs as a chain of alarm-triggered chunks, same as a
+  // scan — this only confirms the first chunk started. The final counts
+  // and row removal arrive via the executeProgress/executeResult
+  // storage.onChanged handlers above.
   const result = await sendMessage({ type: "EXECUTE", domains: checkedDomains });
-  confirmButton.disabled = false;
-
-  if (result.ok) {
-    statusEl.textContent = `Done — ${result.trashedCount} messages moved to Trash, ${result.unsubscribedCount} unsubscribed.`;
-    for (const domain of checkedDomains) {
-      listEl.querySelector(`.row[data-domain="${CSS.escape(domain)}"]`)?.remove();
-    }
-    updateSelectAllState();
-  } else {
+  if (!result.ok && result.error !== "A clean is already in progress.") {
+    confirmButton.disabled = false;
     statusEl.textContent = `Failed: ${result.error}`;
   }
 });

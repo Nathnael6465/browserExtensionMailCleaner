@@ -16,6 +16,25 @@ export function parseListUnsubscribe(header) {
   return result;
 }
 
+// A List-Unsubscribe mailto often carries RFC 2369 ?subject=/?body=
+// query parameters holding the actual subscriber token, e.g.
+// <mailto:unsub@example.com?subject=unsub-8f3a9c>. The raw mailto string
+// (as captured by MAILTO_RE) includes that whole query string, which is
+// not a valid email address on its own — splitting it out here keeps
+// that responsibility as a pure, tested function rather than baking it
+// into whatever builds the actual outgoing message.
+export function parseMailtoUri(mailto) {
+  if (!mailto) return { address: "", subject: null, body: null };
+  const [address, query] = mailto.split("?", 2);
+  const result = { address, subject: null, body: null };
+  if (query) {
+    const params = new URLSearchParams(query);
+    if (params.has("subject")) result.subject = params.get("subject");
+    if (params.has("body")) result.body = params.get("body");
+  }
+  return result;
+}
+
 export function hasOneClickUnsubscribe(header) {
   if (!header) return false;
   return header.includes("List-Unsubscribe=One-Click");

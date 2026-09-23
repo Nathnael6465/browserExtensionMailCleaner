@@ -5,6 +5,7 @@ import {
   hasOneClickUnsubscribe,
   parseAuthenticationResults,
   decodeMimeWords,
+  parseMailtoUri,
 } from "../src/headers.js";
 
 // --- parseListUnsubscribe ---
@@ -105,4 +106,34 @@ test("returns empty string for missing header", () => {
 test("malformed encoded-word marker does not throw, falls back to raw text", () => {
   const header = "=?utf-8?b?not-valid-base64!!!?=";
   assert.doesNotThrow(() => decodeMimeWords(header));
+});
+
+// --- parseMailtoUri ---
+
+test("plain mailto address with no query params", () => {
+  const result = parseMailtoUri("unsub@example.com");
+  assert.equal(result.address, "unsub@example.com");
+  assert.equal(result.subject, null);
+  assert.equal(result.body, null);
+});
+
+test("mailto with a subject query param carrying the subscriber token", () => {
+  const result = parseMailtoUri("unsub@example.com?subject=unsub-8f3a9c");
+  assert.equal(result.address, "unsub@example.com");
+  assert.equal(result.subject, "unsub-8f3a9c");
+  assert.equal(result.body, null);
+});
+
+test("mailto with both subject and body query params", () => {
+  const result = parseMailtoUri("unsub@example.com?subject=leave&body=please+remove+me");
+  assert.equal(result.address, "unsub@example.com");
+  assert.equal(result.subject, "leave");
+  assert.equal(result.body, "please remove me");
+});
+
+test("empty mailto returns an empty address", () => {
+  const result = parseMailtoUri("");
+  assert.equal(result.address, "");
+  assert.equal(result.subject, null);
+  assert.equal(result.body, null);
 });
